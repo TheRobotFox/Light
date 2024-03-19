@@ -1,0 +1,7 @@
+[Unit]
+Description=Lightd
+[Service]
+ExecStart=/usr/bin/lightd
+
+[Install]
+WantedBy=default.target
