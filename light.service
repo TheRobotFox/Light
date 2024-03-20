@@ -1,7 +1,9 @@
 [Unit]
 Description=Lightd
+
 [Service]
+Type=simple
 ExecStart=/usr/bin/lightd
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
