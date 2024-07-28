@@ -1,4 +1,5 @@
 #include <ddcutil_types.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -7,6 +8,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <pthread.h>
 
 #include <ddcutil_c_api.h>
 #include <ddcutil_status_codes.h>
@@ -16,7 +19,11 @@
 
 #define BRIGHTNESS 0x10
 
-IMPLEMENT_LIST(DDCA_Display_Handle)
+typedef struct {
+    DDCA_Display_Ref ref;
+    DDCA_Display_Handle handle;
+    DDCA_Non_Table_Vcp_Value brightness;
+} Display;
 
 bool display_check_feature(DDCA_Display_Handle h, DDCA_Vcp_Feature_Code feature)
 {
@@ -41,53 +48,85 @@ bool display_check_feature(DDCA_Display_Handle h, DDCA_Vcp_Feature_Code feature)
     return ddca_feature_list_contains(features, feature);
 }
 
-LIST(DDCA_Display_Handle) get_compactible_dispaly_handles(DDCA_Vcp_Feature_Code feature)
+bool cmp_ref(const void *e, const void *t)
 {
+    const Display *a=e, *b=t;
+    return a->ref==b->ref;
+}
+
+void sync_Displays(LIST(Display) list, bool dirty)
+{
+    // get all refs
     DDCA_Display_Ref *refs = NULL;
     ddca_get_display_refs(false, &refs);
     if(!refs){
-        printf("[ERROR] Could not obtain Diplay referneces!\n");
+        printf("[ERROR] Could not obtain Display referneces!\n");
         exit(-1);
     }
 
-    LIST(DDCA_Dispay_Handle) list = LIST_create(DDCA_Display_Handle);
-
     while(*refs){
+        // check valid ref and or new Ref
+        Display *present = List_finde(list, cmp_ref, refs);
         if(ddca_validate_display_ref(*refs, false) != DDCRC_OK){
             printf("[WARINING] Got invalid Display Reference.\n");
-            goto end;
+
+            // cleanup present
+            if(present){
+                ddca_close_display(present->handle);
+                List_rme(list, present);
+            }
+            goto next;
+        }
+        if(present && !dirty) goto next;
+
+        // get handle
+        if(!present){
+
+            // get handle
+            DDCA_Display_Handle h;
+
+            if(ddca_open_display2(*refs, false, &h) != DDCRC_OK){
+                printf("[WARNING] Could not get Display Handle.\n");
+                goto next;
+            }
+
+            // has Brightness attribute
+            if(!display_check_feature(h, BRIGHTNESS)){
+                ddca_close_display(h);
+                goto next;
+            }
+            present = List_push(list, NULL);
+            present->ref = *refs;
+            present->handle = h;
         }
 
-        DDCA_Display_Handle h;
-
-        if(ddca_open_display2(*refs, false, &h) != DDCRC_OK){
-            printf("[WARNING] Could not get Disply Handle.\n");
-            goto end;
+        if(ddca_get_non_table_vcp_value(present->handle, BRIGHTNESS, &present->brightness) != DDCRC_OK){
+            printf("[WARNING] Failed to Read Display! (%p;%p)\n", present->ref, present->handle);
+            ddca_close_display(present->handle);
+            List_rme(list, present);
+            goto next;
         }
 
-        if(display_check_feature(h, feature))
-            LIST_push(DDCA_Display_Handle)(list, h);
-
-        end:
+        next:
         refs++;
     }
-    return list;
 }
 
-void Display_List_free(LIST(DDCA_Display_Handle) list)
+void Display_List_free(LIST(Display) list)
 {
-    LIST_LOOP(DDCA_Display_Handle, list, e){
-        ddca_close_display(*e);
+    LIST_LOOP(Display, list, e){
+        ddca_close_display(e->handle);
     }
     LIST_free(list);
 }
 
+
 static void init_daemon(void)
 {
     // Permissions
-    if(setgid(100) || setuid(1000)){
-        printf("[WARNING] Failed to lower Permissions!\n");
-    }
+    /* if(setgid(100) || setuid(1000)){ */
+    /*     printf("[WARNING] Failed to lower Permissions!\n"); */
+    /* } */
 
     // Signals
     sigset_t set;
@@ -100,13 +139,20 @@ static void init_daemon(void)
         printf("[WARNING] Could not cd to root\n");
     }
     // priority
-    /* nice(10); */
+    nice(10);
 }
 
-static volatile int run = 1;
+static int run = 1;
 
+
+pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+pthread_t sync_thread;
+
+char *path = "/tmp/brighnessctlr";
 static void stop(int signo)
 {
+    remove(path);
+    pthread_cancel(sync_thread);
     run = 0;
 }
 
@@ -115,6 +161,26 @@ static void init_pipe(char *path)
     if(mkfifo(path, S_IRWXO | S_IRWXU | S_IRWXG) == EEXIST){
         printf("[WARNING] lightd terminated inapproprately!\n");
     }
+}
+typedef struct {
+    LIST(Display) displays;
+    bool dirty;
+} Ctx;
+
+void* sync_thread_function(void *_ctx)
+{
+    Ctx *ctx = _ctx;
+    while(true) {
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+        sleep(5);
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+        pthread_mutex_lock(&mut);
+
+        sync_Displays(ctx->displays, ctx->dirty);
+        ctx->dirty=true;
+        pthread_mutex_unlock(&mut);
+    }
+    return NULL;
 }
 
 int main(void)
@@ -127,35 +193,43 @@ int main(void)
 
     ddca_init2("", DDCA_SYSLOG_ERROR, DDCA_INIT_OPTIONS_NONE, NULL);
 
-    // obtain display Handles
-    // find dispalys with appropriate feature
-    LIST(DDCA_Display_Handle) handles = get_compactible_dispaly_handles(BRIGHTNESS);
+    LIST(Display) list = LIST_create(Display);
+    sync_Displays(list, true);
 
-    int pipe = open(path, O_RDONLY);
+    Ctx ctx = {list, false};
+
+    pthread_create(&sync_thread, NULL, sync_thread_function, &ctx);
+
     signal(SIGINT, stop);
     signal(SIGABRT, stop);
 
+    int pipe;
     int8_t delta;
-    while(run){
-        if(read(pipe, &delta, 1) != 1) continue;
+    start:
+    pipe = open(path, O_RDONLY);
 
-        LIST_LOOP(DDCA_Display_Handle, handles, e){
-            // get curret brightness
-            DDCA_Non_Table_Vcp_Value val;
-            if(ddca_get_non_table_vcp_value(*e, BRIGHTNESS, &val) != DDCRC_OK){
-                printf("[WARNING] Failed to get current value!\n");
-                continue;
-            }
-            int new = val.sl+delta;
+    while(run){
+        int res = read(pipe, &delta, 1);
+        if(res == EINTR) break;
+        if(res != 1) goto start;
+
+        pthread_mutex_lock(&mut);
+
+        LIST_LOOP(Display, ctx.displays, d){
+            DDCA_Non_Table_Vcp_Value val = d->brightness;
+            int new = val.sl + delta;
             if(new>val.ml) new=val.ml;
             if(new<0) new=0;
-            if(new!=val.sl) ddca_set_non_table_vcp_value(*e, BRIGHTNESS, 0, new);
-
+            if(new!=val.sl) ddca_set_non_table_vcp_value(d->handle, BRIGHTNESS, 0, new);
+            d->brightness.sl = new;
         }
+        ctx.dirty = false;
+        pthread_mutex_unlock(&mut);
 
     }
 
     remove(path);
-    Display_List_free(handles);
+    pthread_join(sync_thread, NULL);
+    Display_List_free(ctx.displays);
     return 0;
 }

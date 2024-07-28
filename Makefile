@@ -6,7 +6,7 @@
 
 CC=gcc
 LFLAGS=-lddcutil
-CFLAGS=-O3 -Wall -Wextra -Wpedantic -Wno-unused $(LFLAGS)
+CFLAGS=-O3 -Wall -Wextra -Wpedantic -Wno-unused $(LFLAGS) #-fsanitize=address
 
 LIST=List/List.o
 CLIENT=light.o $(LIST)
